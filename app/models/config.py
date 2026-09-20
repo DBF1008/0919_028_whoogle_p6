@@ -17,6 +17,8 @@ from cssutils.css.cssstylerule import CSSStyleRule
 # removes warnings from cssutils
 cssutils.log.setLevel(logging.CRITICAL)
 
+logger = logging.getLogger(__name__)
+
 
 def get_rule_for_selector(stylesheet: CSSStyleSheet,
                           selector: str) -> Optional[CSSStyleRule]:
@@ -36,6 +38,47 @@ def get_rule_for_selector(stylesheet: CSSStyleSheet,
 
 
 class Config:
+    # Instance-level configuration derived from the environment. These
+    # attributes are immutable per-instance and must never be overridden by
+    # user-supplied input (URL params, preferences tokens, session config).
+    IMMUTABLE_ATTRS = frozenset([
+        'preferences_key',
+        'cse_api_key',
+        'cse_id',
+        'use_cse',
+        'safe_keys',
+        'accept_language',
+    ])
+
+    # Keys whose values must match an entry of a settings JSON file
+    # (loaded into the Flask app config).
+    _ENUM_SETTINGS = {
+        'tbs': 'TIME_PERIODS',
+        'theme': 'THEMES',
+        'country': 'COUNTRIES',
+        'lang_search': 'LANGUAGES',
+        'lang_interface': 'LANGUAGES',
+    }
+
+    # Fallback allowed values, used when the Flask app context (and its
+    # settings JSON) is unavailable. None means "accept any string".
+    _FALLBACK_ALLOWED = {
+        'TIME_PERIODS': {'', 'qdr:h', 'qdr:d', 'qdr:w', 'qdr:m', 'qdr:y'},
+        'THEMES': {'light', 'dark', 'system'},
+        'COUNTRIES': None,
+        'LANGUAGES': None,
+    }
+
+    # Per-key maximum lengths for user-supplied string values.
+    _MAX_PARAM_LENGTHS = {
+        'block': 512,
+        'near': 256,
+        'user_agent': 512,
+        'custom_user_agent': 512,
+        'style_modified': 100000,
+    }
+    _DEFAULT_MAX_PARAM_LENGTH = 2048
+
     def __init__(self, **kwargs):
         # User agent configuration - default to env_conf if environment variables exist, otherwise default
         env_user_agent = os.getenv('WHOOGLE_USER_AGENT', '')
@@ -105,11 +148,20 @@ class Config:
         if kwargs:
             mutable_attrs = self.get_mutable_attrs()
             for attr in mutable_attrs:
-                if attr == 'show_user_agent':
+                if attr in self.IMMUTABLE_ATTRS:
+                    # Instance-level config cannot be overridden by
+                    # user-supplied values
+                    continue
+                elif attr == 'show_user_agent':
                     # Handle show_user_agent as boolean
                     self.show_user_agent = bool(kwargs.get(attr))
                 elif attr in kwargs.keys():
-                    setattr(self, attr, kwargs[attr])
+                    valid, sanitized = self._sanitize_param(attr, kwargs[attr])
+                    if valid:
+                        setattr(self, attr, sanitized)
+                    else:
+                        logger.warning(
+                            'Ignoring invalid value for config key %r', attr)
                 elif attr not in kwargs.keys() and mutable_attrs[attr] == bool:
                     setattr(self, attr, False)
 
@@ -134,6 +186,107 @@ class Config:
         return {name: attr for name, attr in self.__dict__.items()
                 if not name.startswith("__")
                 and (type(attr) is bool or type(attr) is str)}
+
+    @staticmethod
+    def _sanitize_bool(value) -> tuple:
+        """Normalizes a user-supplied value to a bool.
+
+        Returns:
+            tuple -- (valid, sanitized_value)
+        """
+        if isinstance(value, bool):
+            return True, value
+        if isinstance(value, int) and value in (0, 1):
+            return True, bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in ('1', 'true', 'on', 'yes'):
+                return True, True
+            if normalized in ('0', 'false', 'off', 'no', ''):
+                return True, False
+        return False, None
+
+    @staticmethod
+    def _allowed_values(setting: str) -> Optional[set]:
+        """Returns the set of allowed values for a settings JSON, or None
+        if validation should be skipped for that setting."""
+        try:
+            entries = current_app.config.get(setting)
+        except RuntimeError:
+            entries = None
+        if entries is None:
+            return Config._FALLBACK_ALLOWED.get(setting)
+        values = set()
+        for entry in entries:
+            if isinstance(entry, dict):
+                values.add(entry.get('value', ''))
+            else:
+                values.add(entry)
+        return values
+
+    def _sanitize_enum(self, key: str, value, setting: str) -> tuple:
+        if not isinstance(value, str):
+            return False, None
+        allowed = self._allowed_values(setting)
+        if allowed is not None and value not in allowed:
+            return False, None
+        return True, value
+
+    def _sanitize_param(self, key: str, value) -> tuple:
+        """Validates and normalizes a single user-supplied config value.
+
+        Args:
+            key (str) -- the config attribute name
+            value -- the raw user-supplied value
+
+        Returns:
+            tuple -- (valid, sanitized_value); when valid is False the
+            value must be discarded by the caller
+        """
+        current = getattr(self, key, None)
+        if isinstance(current, bool):
+            return self._sanitize_bool(value)
+        if key in self._ENUM_SETTINGS:
+            return self._sanitize_enum(key, value, self._ENUM_SETTINGS[key])
+        if isinstance(value, str):
+            sanitized = value.strip()
+            # Strip ASCII control characters (except tab/newline) to avoid
+            # propagating malformed values into outgoing search requests
+            sanitized = ''.join(
+                ch for ch in sanitized
+                if ch in '\t\n' or ord(ch) >= 32)
+            max_len = self._MAX_PARAM_LENGTHS.get(
+                key, self._DEFAULT_MAX_PARAM_LENGTH)
+            if len(sanitized) > max_len:
+                sanitized = sanitized[:max_len]
+            return True, sanitized
+        if isinstance(value, (int, float)):
+            return True, value
+        return False, None
+
+    def apply_user_config(self, values: dict) -> 'Config':
+        """Applies a user/session config dict, restricted to mutable,
+        non-instance-level attributes with validated values.
+
+        Args:
+            values (dict) -- user-supplied config values
+
+        Returns:
+            Config -- the modified config object
+        """
+        if not isinstance(values, dict):
+            return self
+        mutable_attrs = self.get_mutable_attrs()
+        for key, value in values.items():
+            if key not in mutable_attrs or key in self.IMMUTABLE_ATTRS:
+                continue
+            valid, sanitized = self._sanitize_param(key, value)
+            if valid:
+                self[key] = sanitized
+            else:
+                logger.warning(
+                    'Ignoring invalid value for config key %r', key)
+        return self
 
     @property
     def style(self) -> str:
@@ -222,13 +375,14 @@ class Config:
         for param_key in params.keys():
             if not self.is_safe_key(param_key):
                 continue
-            param_val = params.get(param_key)
-
-            if param_val == 'off':
-                param_val = False
-            elif isinstance(param_val, str):
-                if param_val.isdigit():
-                    param_val = int(param_val)
+            if param_key in self.IMMUTABLE_ATTRS:
+                continue
+            valid, param_val = self._sanitize_param(param_key,
+                                                    params.get(param_key))
+            if not valid:
+                logger.warning(
+                    'Ignoring invalid value for config key %r', param_key)
+                continue
 
             self[param_key] = param_val
         return self
@@ -295,20 +449,37 @@ class Config:
         return urlsafe_b64encode(compressed_preferences).decode()
 
     def _decode_preferences(self, preferences: str) -> dict:
+        if not preferences:
+            return {}
+
         mode = preferences[0]
         preferences = preferences[1:]
 
         try:
-            decoded_data = brotli.decompress(urlsafe_b64decode(preferences.encode() + b'=='))
+            decoded_data = brotli.decompress(
+                urlsafe_b64decode(preferences.encode() + b'=='))
 
-            if mode == 'e' and self.preferences_key:
+            if mode == 'e':
                 # preferences are encrypted
+                if not self.preferences_key:
+                    logger.warning(
+                        'Encrypted preferences supplied, but no preferences '
+                        'key is configured; falling back to default config')
+                    return {}
                 key = self._get_fernet_key(self.preferences_key)
                 decrypted_data = Fernet(key).decrypt(decoded_data)
                 decoded_data = brotli.decompress(decrypted_data)
 
             config = json.loads(decoded_data)
-        except Exception:
+            if not isinstance(config, dict):
+                logger.warning(
+                    'Decoded preferences payload is not a config dict; '
+                    'falling back to default config')
+                return {}
+        except Exception as e:
+            logger.warning(
+                'Failed to decode preferences token (%s); falling back to '
+                'default config', e)
             config = {}
 
         return config

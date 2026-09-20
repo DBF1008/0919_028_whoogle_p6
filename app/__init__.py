@@ -303,3 +303,10 @@ logging.config.dictConfig({
     'version': 1,
     'disable_existing_loggers': True,
 })
+
+# The dictConfig above disables every logger created so far, including the
+# app's own (they are imported above). Re-enable the app loggers so that
+# warnings (e.g. config/preferences decode failures) are still emitted.
+for _logger_name in list(logging.root.manager.loggerDict):
+    if _logger_name == 'app' or _logger_name.startswith('app.'):
+        logging.getLogger(_logger_name).disabled = False

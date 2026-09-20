@@ -71,7 +71,13 @@ def test_config(client):
 
     config = json.loads(rv.data)
     for key in demo_config.keys():
-        assert config[key] == demo_config[key]
+        expected = demo_config[key]
+        actual = config[key]
+        # Bool config options are sanitized to real booleans when the
+        # session config is loaded, so compare them as their int form
+        if isinstance(actual, bool):
+            actual = str(int(actual))
+        assert actual == expected
 
     # Test disabling changing config from client
     app.config['CONFIG_DISABLE'] = 1

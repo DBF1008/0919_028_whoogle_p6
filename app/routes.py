@@ -15,6 +15,7 @@ from functools import wraps
 import waitress
 from app import app
 from app.models.config import Config
+from app.models.config_manager import config_manager
 from app.models.endpoint import Endpoint
 from app.request import Request, TorError
 from app.services.cse_client import CSEException
@@ -142,8 +143,9 @@ def before_request_func():
         request.args if request.method == 'GET' else request.form
     )
 
-    default_config = json.load(open(app.config['DEFAULT_CONFIG'])) \
-        if os.path.exists(app.config['DEFAULT_CONFIG']) else {}
+    # Default config is cached by the config manager (keyed on file mtime)
+    # to avoid reading it from disk on every request
+    default_config = config_manager.get_default_config()
 
     # Generate session values for user if unavailable
     if not valid_user_session(session):
@@ -153,10 +155,10 @@ def before_request_func():
         session['auth'] = False
 
     # Establish config values per user session
-    g.user_config = Config(**session['config'])
-
-    # Update user config if specified in search args
-    g.user_config = g.user_config.from_params(g.request_params)
+    # (validated/sanitized by the config manager), and update the user
+    # config if specified in search args
+    g.user_config = config_manager.build_user_config(
+        session.get('config', {}), g.request_params)
 
     if not g.user_config.url:
         g.user_config.url = get_request_url(request.url_root)
