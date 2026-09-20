@@ -15,6 +15,7 @@ from functools import wraps
 import waitress
 from app import app
 from app.models.config import Config
+from app.models.config_manager import ConfigManager
 from app.models.endpoint import Endpoint
 from app.request import Request, TorError
 from app.services.cse_client import CSEException
@@ -39,6 +40,10 @@ from werkzeug.datastructures import MultiDict
 
 ac_var = 'WHOOGLE_AUTOCOMPLETE'
 autocomplete_enabled = os.getenv(ac_var, '1')
+
+# Manages caching of the default (on-disk) config and validation of
+# user-supplied config values, avoiding disk IO on every request.
+config_manager = ConfigManager(app.config['DEFAULT_CONFIG'])
 
 
 def get_search_name(tbm):
@@ -142,8 +147,7 @@ def before_request_func():
         request.args if request.method == 'GET' else request.form
     )
 
-    default_config = json.load(open(app.config['DEFAULT_CONFIG'])) \
-        if os.path.exists(app.config['DEFAULT_CONFIG']) else {}
+    default_config = config_manager.get_default_config()
 
     # Generate session values for user if unavailable
     if not valid_user_session(session):
@@ -152,11 +156,10 @@ def before_request_func():
         session['key'] = app.enc_key
         session['auth'] = False
 
-    # Establish config values per user session
-    g.user_config = Config(**session['config'])
-
-    # Update user config if specified in search args
-    g.user_config = g.user_config.from_params(g.request_params)
+    # Establish config values per user session, and update the user
+    # config if specified in search args
+    g.user_config = config_manager.build_user_config(
+        session['config'], g.request_params)
 
     if not g.user_config.url:
         g.user_config.url = get_request_url(request.url_root)

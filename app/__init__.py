@@ -303,3 +303,8 @@ logging.config.dictConfig({
     'version': 1,
     'disable_existing_loggers': True,
 })
+
+# Re-enable the application's own config loggers, so that config
+# validation and preferences decoding warnings remain visible
+for _config_logger in ('app.models.config', 'app.models.config_manager'):
+    logging.getLogger(_config_logger).disabled = False

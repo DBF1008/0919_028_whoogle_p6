@@ -3,8 +3,9 @@ from typing import Optional
 from app.utils.misc import read_config_bool
 from flask import current_app
 import os
+import re
 from base64 import urlsafe_b64encode, urlsafe_b64decode
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 import hashlib
 import brotli
 import logging
@@ -16,6 +17,24 @@ from cssutils.css.cssstylerule import CSSStyleRule
 
 # removes warnings from cssutils
 cssutils.log.setLevel(logging.CRITICAL)
+
+logger = logging.getLogger(__name__)
+
+# Sentinel used to signal that a parameter value failed validation and
+# must be discarded instead of being applied to the config.
+INVALID_PARAM = object()
+
+# Valid values for the 'tbs' (time period) search parameter, optionally
+# followed by additional comma-separated filter segments (e.g. lr:lang_1).
+TBS_PATTERN = re.compile(r'^(qdr:[hdwmy](,[a-z]+:[A-Za-z0-9_-]+)*)?$')
+
+# Maximum accepted length for string parameters coming from the URL or
+# from decoded preferences. Anything longer is rejected as malformed.
+MAX_PARAM_VALUE_LENGTH = 512
+
+# String values that should be interpreted as a falsy boolean when they
+# arrive as URL parameters.
+FALSE_STRINGS = ('', '0', 'off', 'false', 'no')
 
 
 def get_rule_for_selector(stylesheet: CSSStyleSheet,
@@ -36,6 +55,49 @@ def get_rule_for_selector(stylesheet: CSSStyleSheet,
 
 
 class Config:
+    # Instance-level attributes that are derived from the server
+    # environment only. They are immutable for end users: they can never
+    # be overridden through session config (kwargs) or URL parameters.
+    # Everything not listed here (and of type bool/str) is considered
+    # user-mutable configuration.
+    INSTANCE_ATTRS = frozenset([
+        'preferences_key',
+    ])
+
+    # Declarative types for all user-mutable (bool/str) config attributes.
+    # Allows validating user-supplied config data without instantiating
+    # a Config first.
+    MUTABLE_ATTR_TYPES = {
+        'user_agent': str,
+        'custom_user_agent': str,
+        'use_custom_user_agent': bool,
+        'show_user_agent': bool,
+        'url': str,
+        'lang_search': str,
+        'lang_interface': str,
+        'style_modified': str,
+        'block': str,
+        'block_title': str,
+        'block_url': str,
+        'country': str,
+        'tbs': str,
+        'theme': str,
+        'safe': bool,
+        'alts': bool,
+        'nojs': bool,
+        'tor': bool,
+        'near': str,
+        'new_tab': bool,
+        'view_image': bool,
+        'get_only': bool,
+        'anon_view': bool,
+        'preferences_encrypted': bool,
+        'cse_api_key': str,
+        'cse_id': str,
+        'use_cse': bool,
+        'accept_language': bool,
+    }
+
     def __init__(self, **kwargs):
         # User agent configuration - default to env_conf if environment variables exist, otherwise default
         env_user_agent = os.getenv('WHOOGLE_USER_AGENT', '')
@@ -128,6 +190,7 @@ class Config:
     def get_mutable_attrs(self):
         return {name: type(attr) for name, attr in self.__dict__.items()
                 if not name.startswith("__")
+                and name not in self.INSTANCE_ATTRS
                 and (type(attr) is bool or type(attr) is str)}
 
     def get_attrs(self):
@@ -218,20 +281,68 @@ class Config:
             # parameter was not decrypted successfully
             if len(params_new):
                 params = params_new
+            else:
+                logger.warning(
+                    'Ignoring malformed or undecryptable preferences '
+                    'parameter, falling back to default config values')
+                params = {k: v for k, v in params.items()
+                          if k != 'preferences'}
 
         for param_key in params.keys():
             if not self.is_safe_key(param_key):
                 continue
-            param_val = params.get(param_key)
-
-            if param_val == 'off':
-                param_val = False
-            elif isinstance(param_val, str):
-                if param_val.isdigit():
-                    param_val = int(param_val)
+            param_val = self._sanitize_param(param_key,
+                                             params.get(param_key))
+            if param_val is INVALID_PARAM:
+                continue
 
             self[param_key] = param_val
         return self
+
+    def _sanitize_param(self, key, value):
+        """Validates and coerces a single config parameter value against
+        the type of the existing config attribute. Malformed values are
+        rejected (logged and skipped) instead of being silently propagated
+        to search requests.
+
+        Args:
+            key (str) -- the config attribute name
+            value -- the raw value from the URL params or preferences
+
+        Returns:
+            The sanitized value, or INVALID_PARAM if the value is malformed
+        """
+        current = getattr(self, key, None)
+
+        if isinstance(current, bool):
+            if isinstance(value, str):
+                return value.strip().lower() not in FALSE_STRINGS
+            return bool(value)
+
+        if isinstance(current, str):
+            if not isinstance(value, str):
+                logger.warning(
+                    f'Rejecting config param "{key}": expected string, '
+                    f'got {type(value).__name__}')
+                return INVALID_PARAM
+            if len(value) > MAX_PARAM_VALUE_LENGTH:
+                logger.warning(
+                    f'Rejecting config param "{key}": value exceeds '
+                    f'{MAX_PARAM_VALUE_LENGTH} characters')
+                return INVALID_PARAM
+            if key == 'tbs' and not TBS_PATTERN.match(value):
+                logger.warning(
+                    f'Rejecting malformed tbs value: {value!r}')
+                return INVALID_PARAM
+            return value
+
+        # Legacy behavior for values targeting attributes of other types:
+        # convert digit strings to ints and pass everything else through.
+        if value == 'off':
+            return False
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+        return value
 
     def to_params(self, keys: list = []) -> str:
         """Generates a set of safe params for using in Whoogle URLs
@@ -295,21 +406,47 @@ class Config:
         return urlsafe_b64encode(compressed_preferences).decode()
 
     def _decode_preferences(self, preferences: str) -> dict:
+        if not preferences or len(preferences) < 2:
+            logger.warning(
+                'Received empty or truncated preferences token, '
+                'falling back to default config values')
+            return {}
+
         mode = preferences[0]
         preferences = preferences[1:]
 
         try:
             decoded_data = brotli.decompress(urlsafe_b64decode(preferences.encode() + b'=='))
 
-            if mode == 'e' and self.preferences_key:
+            if mode == 'e':
                 # preferences are encrypted
+                if not self.preferences_key:
+                    logger.warning(
+                        'Received encrypted preferences but no '
+                        'preferences key is configured, falling back to '
+                        'default config values')
+                    return {}
                 key = self._get_fernet_key(self.preferences_key)
                 decrypted_data = Fernet(key).decrypt(decoded_data)
                 decoded_data = brotli.decompress(decrypted_data)
 
             config = json.loads(decoded_data)
-        except Exception:
+        except InvalidToken:
+            logger.warning(
+                'Failed to decrypt preferences (invalid token or wrong '
+                'key), falling back to default config values')
             config = {}
+        except Exception:
+            logger.warning(
+                'Failed to decode malformed preferences parameter, '
+                'falling back to default config values')
+            config = {}
+
+        if not isinstance(config, dict):
+            logger.warning(
+                'Decoded preferences are not a config dictionary, '
+                'falling back to default config values')
+            return {}
 
         return config
 
